@@ -52,3 +52,7 @@ Run from the project root:
 python src\weather_lags.py "data\hackathon_preli_dataset - bangladesh_dengue_large_dataset.csv" "data\bangladesh_dengue_weather_lags.csv"
 ```
 
+## Development Acknowledgment
+
+This project was developed with assistance from the GPT-6 Luna model.
+
