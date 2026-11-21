@@ -36,3 +36,19 @@ python -m src.predict_risk --ward CCC_Ward_01 --start 2024-01-01 --end 2024-12-3
 
 Artifacts: `models/dengue_risk_model.joblib`, `models/model_metadata.json`
 (holdout MAE 0.82, RMSE 1.63, R² 0.82 on 2024–25).
+## Data Preparation Contribution
+
+- Added `src/weather_lags.py` to ingest the weekly dengue CSV and generate nine
+  weather lag features: 2-, 3-, and 4-week lags for average temperature, rainfall,
+  and relative humidity, grouped by `ward_id` and matched to exact calendar dates.
+- Configured the pipeline to drop rows missing any required lag value, without
+  imputing data.
+- Generated `data/bangladesh_dengue_weather_lags.csv` and documented the design in
+  [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Run from the project root:
+
+```powershell
+python src\weather_lags.py "data\hackathon_preli_dataset - bangladesh_dengue_large_dataset.csv" "data\bangladesh_dengue_weather_lags.csv"
+```
+
