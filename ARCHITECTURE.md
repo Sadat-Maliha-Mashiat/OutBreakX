@@ -2,171 +2,113 @@
 
 ## System overview
 
-The project has three layers, all driven by the same prepared dataset:
+OutbreakX is a weekly, ward-level dengue early-warning system with one shared
+data pipeline for training, batch inference, and the interactive dashboard.
 
 ```
 data/hackathon_preli_dataset - bangladesh_dengue_large_dataset.csv
+        │
         │  src/weather_lags.py  →  src/outliers.py
         ▼
 data/bangladesh_dengue_weather_lags.csv
         │
-        ├── src/train_model.py  →  models/dengue_risk_model.joblib + model_metadata.json
-        │
-        ├── src/predict_risk.py          (batch CLI scoring)
-        │
-        └── app.py (Streamlit)           (interactive dashboard)
+        ├── src/train_model.py
+        │      └── models/dengue_risk_model.joblib + model_metadata.json
+        ├── src/predict_risk.py  (batch predictions for wards/date windows)
+        └── app.py               (Streamlit dashboard)
 ```
 
-`src/weather_lags.py` prepares the weekly dataset, `src/outliers.py` flags
-suspicious values, `src/train_model.py` fits and persists the model, and
-`src/predict_risk.py` / `app.py` serve predictions from the saved artifacts.
+The system runs locally without external APIs. Dataset loading, model artifacts,
+and derived dashboard tables are cached with Streamlit to avoid repeated file
+reads, model loading, and scoring.
 
-## Data preparation
+## Data preparation and features
 
-`src/weather_lags.py` prepares the weekly dengue dataset for modeling. It creates
-weather features for the previous 2, 3, and 4 calendar weeks, matched by
-`ward_id`, and drops rows without a complete lag history. `src/outliers.py` then
-checks and annotates outliers. Neither script trains or evaluates a model.
+`src/weather_lags.py` reads `date`, `ward_id`, `avg_temp_c`, `rainfall_mm`, and
+`relative_humidity_pct`. Headers are trimmed and lowercased, so `avg_temp_C` is
+also accepted. Dates are parsed, missing ward IDs and duplicate ward/date pairs
+are rejected, and records are sorted by ward and date.
 
-### Inputs and outputs
+For each ward, exact calendar-date lookups attach weather from 2, 3, and 4 weeks
+earlier. Values are never borrowed from another ward or nearby date. This
+produces nine lag features: temperature, rainfall, and humidity at each lag.
+Rows without all nine values are removed rather than imputed. The prepared data
+contains 31,080 weekly rows from 2016-02-01 to 2025-12-29 across 60 wards and
+five city corporations; 240 source rows lack complete lag history.
 
-The pipeline reads `date`, `ward_id`, `avg_temp_c`, `rainfall_mm`, and
-`relative_humidity_pct`. Column names are trimmed and lowercased, so headers such
-as `avg_temp_C` are accepted. Other source columns are retained in the output.
+`src/outliers.py` annotates suspicious values without deleting outbreak peaks.
+It checks impossible values and calculates seasonal robust z-scores within each
+ward and calendar month. Rainfall is scored on a `log1p` scale; dengue counts
+are flagged only on the high side. Optional rainfall winsorization caps values
+at the ward/month 99th percentile, after which lags must be regenerated.
 
-The generated features are:
+`src/model_features.py` defines the inputs shared by every training and serving
+path:
 
-- `avg_temp_c_lag_2w`, `avg_temp_c_lag_3w`, `avg_temp_c_lag_4w`
-- `rainfall_mm_lag_2w`, `rainfall_mm_lag_3w`, `rainfall_mm_lag_4w`
-- `relative_humidity_pct_lag_2w`, `relative_humidity_pct_lag_3w`,
-  `relative_humidity_pct_lag_4w`
+- Three static ward features: population density, water-logging risk, and
+  sanitation score.
+- Five current-weather features and nine 2–4 week weather lags.
+- Four cyclical calendar features: month and ISO-week sine/cosine encodings.
+- Two categorical features: `ward_id` and `city`.
 
-The current output is `data/bangladesh_dengue_weather_lags.csv`, generated from
-`data/hackathon_preli_dataset - bangladesh_dengue_large_dataset.csv`: 31,080
-weekly ward rows spanning 2016-02-01 to 2025-12-29 across 60 wards in 5 city
-corporations (Chattogram, Dhaka North, Dhaka South, Gazipur, Narayanganj).
+## Model selection rationale
 
-### Processing and missing values
+The model is a `HistGradientBoostingRegressor` trained on
+`log1p(dengue_cases)`. Gradient-boosted trees were selected because dengue risk
+is nonlinear: rainfall, temperature, humidity, seasonality, and ward conditions
+interact, and their effects need not follow a fixed linear relationship. The
+histogram-based implementation is efficient enough for repeated local training,
+while native handling of nonlinear splits avoids manually specifying many
+interaction terms.
 
-The pipeline parses dates, validates required columns, and rejects missing ward
-IDs or duplicate `(ward_id, date)` records. It sorts records by ward and date,
-then looks up weather values at the exact date 2, 3, or 4 weeks earlier for the
-same ward. It does not substitute nearby dates or values from other wards.
+The target is log-transformed because case counts are non-negative, skewed, and
+contain outbreak peaks; this reduces the dominance of extreme counts during
+training. Predictions are converted back to the case scale and clipped at zero.
+A regularized histogram booster provides a stronger fit for these tabular,
+interacting inputs than a simple linear baseline without the deployment cost or
+data requirements of a deep-learning model. Model choice is assessed on a later
+time period rather than a random split, which better matches operational use.
 
-If any of the nine lag values is missing, the entire row is removed. Other
-missing fields do not trigger row removal. No lag values are imputed. For the
-current dataset, 31,080 of 31,320 rows remain; 240 rows lack complete lag history.
+Preprocessing is packaged with the model: median imputation for numeric inputs,
+most-frequent imputation and one-hot encoding for categoricals, and the target
+transform. Persisting the complete pipeline prevents training/serving feature
+mismatches.
 
-### Outlier checks
+## Chronological validation and risk tiers
 
-`src/outliers.py` flags, but does not delete, suspicious values. Sanity checks
-count impossible records: negative rainfall or dengue, humidity outside 0–100,
-`max_temp_c` below `min_temp_c`, and average temperature outside the min/max
-range. None occur in the current dataset.
+Training uses a strict time split at **2024-01-01**:
 
-Statistical checks are seasonal and per ward, so monsoon rainfall is not
-mistaken for an error:
+| Partition | Rows | Date range | Purpose |
+|---|---:|---|---|
+| Training | 24,780 | 2016-02-01 to 2023-12-25 | Fit the evaluation model and training-only tier boundaries |
+| Holdout | 6,300 | 2024-01-01 to 2025-12-29 | Evaluate entirely later, unseen seasons |
 
-- Weather: robust z-score within each `ward_id` and calendar month, using the
-  median and MAD with a scale floor. Rainfall is scored on the `log1p` scale;
-  flags are raised at `|z| > 4`.
-- Dengue: the same seasonal score on `log1p`, high side only, because counts are
-  zero-inflated.
-- Isolated spikes: rainfall above 100 mm, or dengue of at least 10 cases, that is
-  more than 2–3× both neighbouring weeks.
-- Static per-ward features (population density, water-logging risk, sanitation)
-  have no within-ward variance and are not checked.
+Holdout results are MAE **0.821**, RMSE **1.625**, R² **0.823**, Spearman ρ
+**0.850**, and tier accuracy **87.4%**. High-risk detection (at or above ward
+q90) has ROC-AUC **0.934**, precision **0.766**, and recall **0.328**. These
+metrics describe retrospective weekly case prediction, not clinical diagnosis.
 
-Flags are written as integer columns named `<column>_outlier`. With
-`--winsorize`, rainfall is capped at the per-ward/month 99th percentile; dengue
-peaks are kept because they are the outbreak signal. If rainfall is capped,
-regenerate weather lags afterwards. Current flags: 1,263 rainfall, 677 rainfall
-jumps, 177 dengue seasonal, 68 dengue jumps, 264 humidity, and 16 temperature.
+Risk tiers use each ward's observed-case quantiles: medium at q75, high at q90,
+and critical at q97. Ward-specific boundaries allow the same predicted count to
+represent different relative risk in different wards; global boundaries are a
+fallback for unseen wards. After evaluation, the deployment model is refit on
+all rows, and deployment boundaries are recomputed from the full dataset.
 
-## Feature engineering
+## Inference and dashboard
 
-`src/model_features.py` holds the shared definitions used by training, batch
-inference, and the dashboard:
+`src/predict_risk.py` loads the saved pipeline and metadata, filters the prepared
+data by one or more wards and an optional date window, and returns weekly case
+predictions, risk tiers, and risk ratios. Both serving paths use the same loader
+and risk-tier helpers.
 
-- 22 numeric features: 3 static ward characteristics (`population_density_sqkm`,
-  `water_logging_risk_index`, `sanitation_score`), 5 current-weather readings,
-  9 weather lags (2–4 weeks for temperature, rainfall, humidity), and 4 cyclical
-  calendar encodings (`month_sin`/`month_cos`, `week_sin`/`week_cos`) derived
-  from the `date` column.
-- 2 categorical features: `ward_id`, `city`.
-- Risk-tier helpers. `compute_ward_cutoffs` derives per-ward `q75`/`q90`/`q97`
-  quantiles of observed `dengue_cases` as dynamic tier boundaries, and
-  `assign_risk_tiers` maps any case count to low/medium/high/critical against
-  those boundaries. `resolve_boundaries` falls back to global cutoffs for wards
-  without stored per-ward boundaries (the dataset's 60 wards vs 55 stored
-  cutoffs). The same predicted count can therefore mean different risk in
-  different wards.
+The Streamlit dashboard provides single-week prediction and weather-driver
+analysis, a ward/week heatmap, 1–12 week forecasts, chronological validation,
+and a data explorer. Forecast weather is explicitly assumed from ward
+climatology or the latest observed week; it is not a live weather forecast.
+Forecast intervals use empirical 2024–2025 holdout residuals. Because the
+deployed model was refit on all data, the dashboard separately trains and caches
+a pre-2024 evaluation model for genuinely out-of-sample validation charts.
 
-## Model training
-
-`src/train_model.py` trains, evaluates, and persists the model:
-
-- Pipeline: median imputation for numerics, most-frequent imputation +
-  one-hot encoding for categoricals (`ColumnTransformer`), then
-  `HistGradientBoostingRegressor`, all wrapped in a `TransformedTargetRegressor`
-  that fits on `log1p(dengue_cases)` and predicts back on the case scale.
-- Split: strict time holdout at 2024-01-01 — 24,780 train rows (2016–2023),
-  6,300 holdout rows (2024–2025).
-- Evaluation on the holdout: MAE 0.821 and RMSE 1.625 weekly cases, R² 0.823,
-  Spearman ρ 0.850, tier accuracy 87.4%, macro F1 0.532, and high-risk
-  (≥ q90) detection with ROC-AUC 0.934 at 76.6% precision / 32.8% recall.
-- Deployment: after evaluation, the pipeline refits on all 31,080 rows so the
-  deployed model uses the most recent seasons, and stores per-ward cutoffs
-  computed on the full dataset.
-- Artifacts: `models/dengue_risk_model.joblib` and `models/model_metadata.json`
-  (model spec, feature lists, split windows, metrics, per-ward and global
-  cutoffs). `src/predict_risk.py::load_artifacts` is the single loader used by
-  both serving paths.
-
-## Batch inference
-
-`src/predict_risk.py` scores a ward/time window from the prepared CSV and saved
-artifacts (`python -m src.predict_risk --ward CCC_Ward_01 --start ... --end ...`).
-It validates wards against the dataset, clips predictions at zero, attaches the
-per-ward tier and a `risk_ratio` (prediction ÷ ward q90), and reports actual
-cases/tiers where the dataset has them.
-
-## Dashboard
-
-`app.py` is a Streamlit application (`streamlit run app.py`) with five tabs,
-built on the same artifacts and tier helpers. It caches the dataset, artifact
-loading, and every derived table with `st.cache_data`/`st.cache_resource`.
-
-- **Predict & Drivers**: scores one ward-week with the deployed model. Inputs
-  pre-fill from observed data and are editable for what-if analysis. The driver
-  breakdown approximates each feature's contribution as the prediction minus the
-  prediction with that feature set to the ward's historical median; the values
-  are directional, not an exact decomposition, because features interact.
-- **Risk Heatmap**: ward × week matrix of predicted tier / predicted / observed
-  cases, pivoting the fully scored dataset (31,080 predictions, computed once).
-- **Multi-Week Forecast**: 1–12 weeks ahead of an anchor week. Future weather is
-  assumed from per-ward per-ISO-week climatology or the last observed week, with
-  optional temperature/rainfall anomalies; lag features are resolved by exact
-  calendar-date lookup on the combined observed-plus-synthetic series, mirroring
-  `weather_lags.py`. Intervals are empirical quantiles of 2024–25 holdout
-  residuals, taken per predicted risk tier (sparse tiers fall back to pooled
-  residuals) at 50/80/95% levels.
-- **Model Validation**: chronological MAE/RMSE and tier diagnostics on the
-  holdout. Because the deployed model was refit on all rows, scoring 2024–25 with
-  it would leak; the dashboard therefore retrains the evaluation model on
-  2016–2023 at first load (~2s, cached) so every validation number is genuinely
-  out-of-sample. Global driver importance is permutation importance of each input
-  against holdout MAE.
-- **Data Explorer**: statistical views of the dataset (city trends, seasonality,
-  Spearman correlations, distributions, outlier-flag counts).
-
-The dashboard adds no new dependencies beyond the training stack: `streamlit`
-and `plotly` (both listed in `requirements.txt`).
-
-## Scope
-
-The data pipeline expects weekly observations but does not enforce a specific
-weekday. It performs exact calendar-date lookups and does not create data splits,
-train a model, or calculate evaluation metrics. The model serves weekly ward-level
-risk estimates only; it is not an individual clinical predictor, and multi-week
-forecasts inherit the uncertainty of their assumed weather inputs.
+The main limitation is that predictions depend on historical relationships and
+assumed future weather. They should support—not replace—public-health judgment,
+surveillance, and field investigation.
