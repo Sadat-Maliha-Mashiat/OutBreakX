@@ -5,6 +5,13 @@ Run with:  streamlit run app.py
 Tabs: ward prediction + driver breakdown, ward-by-week risk heatmap,
 multi-week forecast with empirical confidence intervals, chronological
 holdout validation (MAE/RMSE), and a statistical data explorer.
+
+Performance notes: the scikit-learn pipeline costs ~7 ms per ``predict`` call
+regardless of row count, so predictions are always issued as ONE batched call
+per operation (a single ward-week driver breakdown, or all forecast weeks and
+their per-feature perturbations at once). Per-tab figures and derived tables
+are cached with ``st.cache_data`` keyed on plain scalars, so changing a widget
+only recomputes the outputs that actually depend on it.
 """
 
 from __future__ import annotations
@@ -196,10 +203,12 @@ def residual_bands() -> dict:
 
 
 @st.cache_data
-def ward_normals() -> pd.DataFrame:
-    """Per-ward climatology: mean weather per ISO week, plus static ward features."""
+def ward_normals(anchor: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Per-ward climatology using only observations available by the anchor."""
     frame = get_data()
     tmp = frame.copy()
+    if anchor is not None:
+        tmp = tmp[tmp["date"] <= anchor]
     tmp["iso_week"] = tmp["date"].dt.isocalendar().week.astype(int)
     normals = tmp.groupby(["ward_id", "iso_week"])[WEATHER_COLS].mean().reset_index()
     static = tmp[["ward_id", "city"] + STATIC_COLS].drop_duplicates("ward_id")
@@ -212,6 +221,67 @@ def ward_normals() -> pd.DataFrame:
 def predict_rows(rows: pd.DataFrame) -> np.ndarray:
     model, _metadata, _cutoffs, _global = get_artifacts()
     return np.clip(model.predict(rows[NUMERIC_FEATURES + CATEGORICAL_FEATURES]), 0, None)
+
+
+def _batch_predict(feats: list[dict], ward_id: str, city: str) -> np.ndarray:
+    """Score many feature dicts in ONE pipeline pass.
+
+    A ``predict`` call on this pipeline costs ~7 ms no matter the row count,
+    so batching ~25 rows per call instead of issuing one call per row is the
+    difference between ~200 ms and ~8 ms.
+    """
+    batch = pd.DataFrame(feats)
+    batch["ward_id"] = ward_id
+    batch["city"] = city
+    return predict_rows(batch)
+
+
+def ward_medians(ward_id: str) -> dict:
+    """Historical median of every numeric feature for one ward (its 'normal')."""
+    history = get_data()[get_data()["ward_id"] == ward_id]
+    return {c: float(history[c].median()) for c in NUMERIC_FEATURES}
+
+
+def _driver_calc(ward_id: str, city: str, feat: dict) -> tuple[pd.DataFrame, float, float]:
+    """Approximate per-feature contribution to one prediction.
+
+    Contribution of a feature = prediction with the real value minus prediction
+    with that feature set to the ward's historical median (its "normal"). The
+    values do not sum exactly (features interact), so they are shown as the
+    top directional drivers rather than an exact decomposition. All candidate
+    rows are scored with a single batched ``predict`` call.
+    """
+    normals = ward_medians(ward_id)
+    base_feat = {c: normals[c] for c in NUMERIC_FEATURES}
+    changed = [c for c in NUMERIC_FEATURES if abs(float(feat[c]) - normals[c]) >= 1e-9]
+    preds = _batch_predict(
+        [feat, base_feat] + [{**feat, col: normals[col]} for col in changed], ward_id, city
+    )
+    full_pred = float(preds[0])
+    base_pred = float(preds[1])
+    rows = [
+        {
+            "feature": col,
+            "label": FRIENDLY.get(col, col),
+            "actual": float(feat[col]),
+            "normal": normals[col],
+            "delta": full_pred - float(perturbed_pred),
+        }
+        for col, perturbed_pred in zip(changed, preds[2:])
+    ]
+    drivers = pd.DataFrame(rows)
+    if not drivers.empty:
+        drivers["abs_delta"] = drivers["delta"].abs()
+        drivers = drivers.sort_values("abs_delta", ascending=False).reset_index(drop=True)
+    return drivers, full_pred, base_pred
+
+
+@st.cache_data(show_spinner=False)
+def compute_drivers(
+    ward_id: str, city: str, values: tuple[float, ...]
+) -> tuple[pd.DataFrame, float, float]:
+    """Cached driver breakdown for one ward-week (hashable scalar inputs)."""
+    return _driver_calc(ward_id, city, dict(zip(NUMERIC_FEATURES, values)))
 
 
 def tier_for(ward_id: str, pred: float) -> str:
@@ -235,46 +305,6 @@ def tier_interval(pred: float, tier: str, level: int) -> tuple[float, float]:
     return max(0.0, pred + band[low_key]), max(0.0, pred + band[high_key])
 
 
-def local_drivers(feat: dict, ward_id: str) -> tuple[pd.DataFrame, float, float]:
-    """Approximate per-feature contribution to one prediction.
-
-    Contribution of a feature = prediction with the real value minus prediction
-    with that feature set to the ward's historical median (its "normal"). The
-    values do not sum exactly (features interact), so they are shown as the
-    top directional drivers rather than an exact decomposition.
-    """
-    frame = get_data()
-    history = frame[frame["ward_id"] == ward_id]
-    full_pred = float(predict_rows(pd.DataFrame([feat]))[0])
-    normals = {c: float(history[c].median()) for c in NUMERIC_FEATURES}
-    base_row = dict(feat)
-    for col, value in normals.items():
-        base_row[col] = value
-    base_pred = float(predict_rows(pd.DataFrame([base_row]))[0])
-    rows = []
-    for col in NUMERIC_FEATURES:
-        actual_value = float(feat[col])
-        if abs(actual_value - normals[col]) < 1e-9:
-            continue
-        perturbed = dict(feat)
-        perturbed[col] = normals[col]
-        perturbed_pred = float(predict_rows(pd.DataFrame([perturbed]))[0])
-        rows.append(
-            {
-                "feature": col,
-                "label": FRIENDLY.get(col, col),
-                "actual": actual_value,
-                "normal": normals[col],
-                "delta": full_pred - perturbed_pred,
-            }
-        )
-    drivers = pd.DataFrame(rows)
-    if not drivers.empty:
-        drivers["abs_delta"] = drivers["delta"].abs()
-        drivers = drivers.sort_values("abs_delta", ascending=False).reset_index(drop=True)
-    return drivers, full_pred, base_pred
-
-
 def build_forecast(
     ward_id: str,
     anchor_date: pd.Timestamp,
@@ -290,8 +320,12 @@ def build_forecast(
     series, mirroring ``src/weather_lags.py``.
     """
     frame = get_data()
-    hist = frame[frame["ward_id"] == ward_id].sort_values("date").reset_index(drop=True)
-    normals = ward_normals()
+    hist = frame[
+        (frame["ward_id"] == ward_id) & (frame["date"] <= anchor_date)
+    ].sort_values("date").reset_index(drop=True)
+    if hist.empty:
+        raise ValueError(f"No observations for {ward_id} on or before {anchor_date:%Y-%m-%d}")
+    normals = ward_normals(anchor_date)
     ward_normal = normals[normals["ward_id"] == ward_id]
     last = hist.iloc[-1]
 
@@ -334,8 +368,74 @@ def build_forecast(
     return feat
 
 
+def _forecast_top_drivers(
+    ward_id: str, city: str, feat: pd.DataFrame, preds: np.ndarray
+) -> list[str]:
+    """Top driver label per forecast week, all perturbations in one predict call."""
+    normals = ward_medians(ward_id)
+    batch: list[dict] = []
+    meta: list[tuple[int, str]] = []
+    for i in range(len(feat)):
+        row_vals = {c: float(feat.iloc[i][c]) for c in NUMERIC_FEATURES}
+        for col in NUMERIC_FEATURES:
+            if abs(row_vals[col] - normals[col]) < 1e-9:
+                continue
+            batch.append({**row_vals, col: normals[col]})
+            meta.append((i, col))
+    if not batch:
+        return ["—"] * len(feat)
+    perturbed_preds = _batch_predict(batch, ward_id, city)
+    best: dict[int, tuple[str, float]] = {}
+    for (i, col), perturbed_pred in zip(meta, perturbed_preds):
+        delta = float(preds[i] - perturbed_pred)
+        if i not in best or abs(delta) > abs(best[i][1]):
+            best[i] = (col, delta)
+    return [
+        "—" if i not in best else f"{FRIENDLY.get(best[i][0], best[i][0])} ({best[i][1]:+.1f})"
+        for i in range(len(feat))
+    ]
+
+
+@st.cache_data(show_spinner=False)
+def compute_forecast(
+    ward_id: str,
+    anchor: str,
+    horizon: int,
+    scenario: str,
+    temp_delta: float,
+    rain_mult: float,
+    level: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Full forecast pipeline in one shot: one batched predict for the weekly
+    predictions (plus one for all driver perturbations), vectorized tier
+    assignment, and empirical intervals. Inputs are hashable scalars."""
+    _model, _metadata, cutoffs, global_cutoffs = get_artifacts()
+    feat = build_forecast(ward_id, pd.Timestamp(anchor), horizon, scenario, temp_delta, rain_mult)
+    preds = predict_rows(feat)
+    tiers = assign_risk_tiers(preds, feat["ward_id"], cutoffs, global_cutoffs).tolist()
+    bands = residual_bands()
+    low_key, high_key = {50: ("lo50", "hi50"), 80: ("lo80", "hi80"), 95: ("lo95", "hi95")}[level]
+    lows, highs = [], []
+    for p, t in zip(preds, tiers):
+        band = bands.get(t, bands["_global"])
+        lows.append(max(0.0, p + band[low_key]))
+        highs.append(max(0.0, p + band[high_key]))
+    table = pd.DataFrame(
+        {
+            "week": feat["date"],
+            "predicted_cases": np.round(preds, 1),
+            "tier": tiers,
+            "interval_low": [round(v, 1) for v in lows],
+            "interval_high": [round(v, 1) for v in highs],
+            "top_driver": _forecast_top_drivers(ward_id, feat["city"].iloc[0], feat, preds),
+        }
+    )
+    weather = feat[["date", "rainfall_mm", "avg_temp_c"]].reset_index(drop=True)
+    return table, weather
+
+
 # --------------------------------------------------------------------------- #
-# Figure helpers
+# Figure helpers (pure builders — cached wrappers live in the tab section)
 # --------------------------------------------------------------------------- #
 def tier_colorscale() -> list:
     c = [TIER_COLORS[t] for t in TIER_ORDER]
@@ -405,119 +505,25 @@ def tier_badge(tier: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Tabs
+# Cached per-tab figures — keyed on plain scalars so unrelated widget changes
+# are cache hits and only affected figures are rebuilt.
 # --------------------------------------------------------------------------- #
-def ward_selector(data: pd.DataFrame, key_prefix: str) -> tuple[str, pd.DataFrame]:
-    cities = sorted(data["city"].unique())
-    city = st.selectbox("City corporation", cities, key=f"{key_prefix}_city")
-    wards = sorted(data[data["city"] == city]["ward_id"].unique())
-    ward = st.selectbox("Ward", wards, key=f"{key_prefix}_ward")
-    return ward, data[data["ward_id"] == ward].sort_values("date").reset_index(drop=True)
+@st.cache_data(show_spinner=False)
+def gauge_fig(ratio: float, tier: str, q75: float, q90: float, q97: float) -> go.Figure:
+    return risk_gauge(ratio, tier, {"q75": q75, "q90": q90, "q97": q97})
 
 
-def predict_tab(data: pd.DataFrame) -> None:
-    st.subheader("Predict risk for one ward-week")
-    st.caption(
-        "Pick a ward and week — inputs pre-fill from observed data. Adjust weather to test "
-        "what-if scenarios; lag weather can be overridden under *Advanced*."
-    )
-    left, right = st.columns([1, 1.6], gap="large")
-    with left:
-        ward, ward_df = ward_selector(data, "pred")
-        labels = [
-            f"{d:%Y-%m-%d}  (week {int(pd.Timestamp(d).isocalendar().week):02d})"
-            for d in ward_df["date"]
-        ]
-        ix = st.selectbox("Target week", range(len(labels)), index=len(labels) - 1,
-                          format_func=lambda i: labels[i], key="pred_week")
-        row = ward_df.iloc[ix]
-
-        st.markdown("**Current-week weather**")
-        c1, c2 = st.columns(2)
-        temp = c1.slider("Avg temp °C", 5.0, 45.0, float(row["avg_temp_c"]), 0.1, key="pred_t")
-        rain = c2.slider("Rainfall mm", 0.0, 400.0, float(row["rainfall_mm"]), 0.5, key="pred_r")
-        hum = c1.slider("Humidity %", 0.0, 100.0, float(row["relative_humidity_pct"]), 0.5, key="pred_h")
-        maxt = c2.slider("Max temp °C", 5.0, 50.0, float(row["max_temp_c"]), 0.1, key="pred_maxt")
-        mint = st.slider("Min temp °C", -5.0, 40.0, float(row["min_temp_c"]), 0.1, key="pred_mint")
-
-        overrides = {
-            "avg_temp_c": temp, "rainfall_mm": rain, "relative_humidity_pct": hum,
-            "max_temp_c": maxt, "min_temp_c": mint,
-        }
-        with st.expander("Advanced: lag weather & ward profile"):
-            for col in NUMERIC_FEATURES:
-                if "lag" not in col and col not in STATIC_COLS:
-                    continue
-                step = 0.01 if col in STATIC_COLS else 0.1
-                overrides[col] = st.number_input(
-                    FRIENDLY.get(col, col), value=float(row[col]), step=step, format="%.2f",
-                    key=f"pred_{col}",
-                )
-
-    feat = {c: float(row[c]) for c in NUMERIC_FEATURES}
-    feat.update({k: float(v) for k, v in overrides.items()})
-    feat["ward_id"] = ward
-    feat["city"] = row["city"]
-
-    drivers, pred, base_pred = local_drivers(feat, ward)
-    tier = tier_for(ward, pred)
-    cut = ward_cutoffs(ward)
-    lo, hi = tier_interval(pred, tier, 80)
-
-    with right:
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Predicted cases", f"{pred:.1f}", delta=f"{pred - base_pred:+.1f} vs ward normal")
-        m2.metric("Risk tier", tier.capitalize())
-        m3.metric("80% interval", f"{lo:.1f} – {hi:.1f}")
-        st.markdown(
-            f"Ward thresholds: medium ≥ **{cut['q75']:.0f}**, high ≥ **{cut['q90']:.0f}**, "
-            f"critical ≥ **{cut['q97']:.0f}** weekly cases",
-            help="Per-ward quantiles (q75/q90/q97) of observed cases; the same count can mean "
-                 "different risk in different wards.",
-        )
-        st.plotly_chart(risk_gauge(pred / cut["q90"], tier, cut), use_container_width=True)
-
-        observed = float(row[TARGET_COLUMN])
-        obs_tier = tier_for(ward, observed)
-        st.info(
-            f"Observed in {row['date']:%Y-%m-%d}: **{observed:.0f} cases** "
-            f"({obs_tier}) — model {'over' if pred > observed else 'under'}-predicts by "
-            f"{abs(observed - pred):.1f}."
-        )
-
-        st.markdown("**What is driving this prediction?**")
-        if drivers.empty:
-            st.caption("All inputs sit at the ward's historical median — no strong driver this week.")
-        else:
-            st.plotly_chart(drivers_chart(drivers), use_container_width=True)
-            show = drivers.head(8)[["label", "actual", "normal", "delta"]].copy()
-            show.columns = ["Driver", "This input", "Ward normal", "Δ cases"]
-            show["This input"] = show["This input"].round(2)
-            show["Ward normal"] = show["Ward normal"].round(2)
-            show["Δ cases"] = show["Δ cases"].round(2)
-            st.dataframe(show, hide_index=True, use_container_width=True)
-            st.caption(
-                "Contribution = prediction with the real input minus prediction with that input "
-                "set to the ward's median. Approximate — features interact, so values won't sum "
-                "exactly to the total."
-            )
+@st.cache_data(show_spinner=False)
+def drivers_fig(drivers: pd.DataFrame) -> go.Figure:
+    return drivers_chart(drivers)
 
 
-def heatmap_tab(scores: pd.DataFrame) -> None:
-    st.subheader("Ward-level risk heatmap")
-    st.caption("Every ward-week at a glance — spot outbreaks spreading across wards and weeks.")
-    years = sorted(scores["date"].dt.year.unique())
-    cities = sorted(scores["city"].unique())
-    c1, c2, c3 = st.columns([1, 2, 2])
-    year = c1.selectbox("Year", years, index=len(years) - 1)
-    sel_cities = c2.multiselect("City corporations", cities, default=cities)
-    metric = c3.radio("Colour by", ["Predicted risk tier", "Predicted cases", "Observed cases"],
-                      horizontal=True)
-
-    data = scores[(scores["city"].isin(sel_cities)) & (scores["date"].dt.year == year)]
+@st.cache_data(show_spinner=False)
+def heatmap_fig(year: int, cities: tuple[str, ...], metric: str) -> go.Figure | None:
+    scores = score_history()
+    data = scores[(scores["city"].isin(cities)) & (scores["date"].dt.year == year)]
     if data.empty:
-        st.warning("No data for this selection.")
-        return
+        return None
     value_col = {"Predicted risk tier": "risk_rank", "Predicted cases": "predicted_cases",
                  "Observed cases": "actual_cases"}[metric]
     pivot = data.pivot_table(index="ward_id", columns="date", values=value_col, aggfunc="mean")
@@ -554,29 +560,455 @@ def heatmap_tab(scores: pd.DataFrame) -> None:
         xaxis=dict(tickformat="%d %b", dtick=28 * 24 * 3600 * 1000),
         yaxis=dict(autorange="reversed"),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    return fig
 
+
+@st.cache_data(show_spinner=False)
+def tier_mix_fig(year: int, cities: tuple[str, ...]) -> go.Figure | None:
+    scores = score_history()
+    data = scores[(scores["city"].isin(cities)) & (scores["date"].dt.year == year)]
+    if data.empty:
+        return None
     share = (
         data.groupby(["city", "risk_tier"]).size().unstack(fill_value=0)
         .reindex(columns=TIER_ORDER, fill_value=0)
     )
     share_pct = share.div(share.sum(axis=1), axis=0) * 100
-    fig2 = px.bar(
+    fig = px.bar(
         share_pct.reset_index().melt(id_vars="city", var_name="tier", value_name="pct"),
         x="city", y="pct", color="tier", color_discrete_map=TIER_COLORS,
         category_orders={"tier": TIER_ORDER},
         labels={"pct": "% of ward-weeks", "city": "", "tier": "Risk tier"},
     )
-    fig2.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
-    st.markdown("**Tier mix per city corporation** (share of ward-weeks)")
-    st.plotly_chart(fig2, use_container_width=True)
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def forecast_fig(
+    ward_id: str,
+    anchor: str,
+    level: int,
+    q90: float,
+    q97: float,
+    table: pd.DataFrame,
+) -> go.Figure:
+    dates = list(table["week"])
+    preds = table["predicted_cases"]
+    tiers = table["tier"]
+    low = list(table["interval_low"])
+    high = list(table["interval_high"])
+    hist = get_data()
+    hist = hist[(hist["ward_id"] == ward_id) & (hist["date"] <= pd.Timestamp(anchor))].tail(8)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=dates + dates[::-1],
+            y=high + low[::-1],
+            fill="toself",
+            fillcolor="rgba(31,119,180,0.18)",
+            line=dict(color="rgba(255,255,255,0)"),
+            name=f"{level}% interval",
+            hovertemplate="%{y:.1f} cases<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=dates, y=preds,
+            mode="lines+markers+text",
+            text=[f"{p:.1f}" for p in preds], textposition="top center",
+            marker=dict(size=11, color=[TIER_COLORS[t] for t in tiers]),
+            line=dict(color="#1f77b4", dash="dash"),
+            name="Forecast",
+        )
+    )
+    if not hist.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=hist["date"], y=hist[TARGET_COLUMN],
+                mode="lines+markers", name="Observed (recent)",
+                line=dict(color="#7f7f7f"),
+            )
+        )
+    for q, name, color in ((q90, "High-risk threshold", "#e67e22"),
+                           (q97, "Critical threshold", "#d62728")):
+        fig.add_hline(
+            y=q, line_dash="dot", line_color=color,
+            annotation_text=name, annotation_position="top left",
+        )
+    fig.update_layout(
+        height=420,
+        margin=dict(l=10, r=10, t=20, b=10),
+        yaxis_title="Weekly dengue cases",
+        xaxis_title="",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def weather_fig(weather: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(x=weather["date"], y=weather["rainfall_mm"], name="Rainfall (mm)",
+               marker_color="#7fb3d5", yaxis="y")
+    )
+    fig.add_trace(
+        go.Scatter(x=weather["date"], y=weather["avg_temp_c"], name="Avg temp °C",
+                   mode="lines+markers", line=dict(color="#c0392b"), yaxis="y2")
+    )
+    fig.update_layout(
+        height=240, margin=dict(l=10, r=10, t=10, b=10),
+        yaxis=dict(title="Rainfall (mm)"),
+        yaxis2=dict(title="Avg temp °C", overlaying="y", side="right"),
+        legend=dict(orientation="h", y=1.15),
+        title=dict(text="Assumed weather inputs", font=dict(size=14)),
+    )
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def error_over_time_fig() -> go.Figure:
+    hs = holdout_scores()
+    weekly = hs.groupby("date").agg(
+        mae=("abs_error", "mean"),
+        rmse=("residual", lambda s: float(np.sqrt((s**2).mean()))),
+    ).reset_index()
+    weekly["mae_4w"] = weekly["mae"].rolling(4, min_periods=1).mean()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=weekly["date"], y=weekly["rmse"], mode="lines",
+                             name="Weekly RMSE", line=dict(color="#c0392b", width=1)))
+    fig.add_trace(go.Scatter(x=weekly["date"], y=weekly["mae"], mode="lines",
+                             name="Weekly MAE", line=dict(color="#2471a3", width=1)))
+    fig.add_trace(go.Scatter(x=weekly["date"], y=weekly["mae_4w"], mode="lines",
+                             name="MAE (4-week avg)", line=dict(color="#2471a3", width=3)))
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10),
+                      yaxis_title="Cases", title=dict(text="Error over time", font=dict(size=15)))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def hardest_wards_fig() -> go.Figure:
+    hs = holdout_scores()
+    ward_mae = hs.groupby(["ward_id", "city"])["abs_error"].mean().reset_index()
+    ward_mae = ward_mae.sort_values("abs_error", ascending=False).head(15).iloc[::-1]
+    fig = px.bar(
+        ward_mae, x="abs_error", y="ward_id", color="city", orientation="h",
+        labels={"abs_error": "Mean absolute error (cases)", "ward_id": "", "city": "City"},
+    )
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10),
+                      title=dict(text="Hardest wards (holdout MAE)", font=dict(size=15)))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def obs_vs_pred_fig() -> go.Figure:
+    hs = holdout_scores()
+    sample = hs.sample(min(2500, len(hs)), random_state=0)
+    fig = px.scatter(
+        sample, x="actual_cases", y="predicted_cases", color="actual_tier",
+        color_discrete_map=TIER_COLORS, category_orders={"actual_tier": TIER_ORDER},
+        opacity=0.55,
+        labels={"actual_cases": "Observed cases", "predicted_cases": "Predicted cases",
+                "actual_tier": "Observed tier"},
+    )
+    lim = float(max(sample["actual_cases"].max(), sample["predicted_cases"].max())) * 1.05
+    fig.add_shape(type="line", x0=0, y0=0, x1=lim, y1=lim,
+                  line=dict(color="black", dash="dot"))
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10),
+                      title=dict(text="Observed vs predicted (holdout sample)", font=dict(size=15)))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def confusion_fig() -> go.Figure:
+    hs = holdout_scores()
+    conf = pd.crosstab(hs["actual_tier"], hs["risk_tier"])
+    conf = conf.reindex(index=TIER_ORDER, columns=TIER_ORDER, fill_value=0)
+    fig = go.Figure(
+        go.Heatmap(
+            z=conf.to_numpy(), x=[t.capitalize() for t in TIER_ORDER],
+            y=[t.capitalize() for t in TIER_ORDER], text=conf.to_numpy(),
+            texttemplate="%{text}", colorscale="Blues", showscale=False,
+            hovertemplate="Observed %{y} → predicted %{x}: %{z} ward-weeks<extra></extra>",
+        )
+    )
+    fig.update_layout(height=330, margin=dict(l=10, r=10, t=10, b=10),
+                      xaxis_title="Predicted tier", yaxis_title="Observed tier",
+                      title=dict(text="Tier confusion matrix", font=dict(size=15)))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def ward_drill_fig(ward: str) -> go.Figure:
+    hs = holdout_scores()
+    sub = hs[hs["ward_id"] == ward].sort_values("date")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=sub["date"], y=sub["actual_cases"], name="Observed",
+                             mode="lines+markers", line=dict(color="#7f7f7f")))
+    fig.add_trace(go.Scatter(x=sub["date"], y=sub["predicted_cases"], name="Predicted",
+                             mode="lines+markers", line=dict(color="#2471a3", dash="dash")))
+    fig.add_trace(go.Bar(x=sub["date"], y=sub["abs_error"], name="Absolute error",
+                         marker_color="#e6b0aa", yaxis="y2"))
+    fig.update_layout(
+        height=330, margin=dict(l=10, r=10, t=10, b=10),
+        yaxis=dict(title="Cases"),
+        yaxis2=dict(title="Abs error", overlaying="y", side="right", showgrid=False),
+        legend=dict(orientation="h", y=1.12),
+        title=dict(text=f"{ward} — observed vs predicted over holdout", font=dict(size=15)),
+    )
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def importance_fig() -> go.Figure:
+    imp = global_importance()
+    show = imp.sort_values("importance").tail(14)
+    fig = px.bar(
+        show, x="importance", y="label", orientation="h",
+        error_x=show["std"],
+        labels={"importance": "MAE increase when shuffled (cases)", "label": ""},
+    )
+    fig.update_layout(height=480, margin=dict(l=10, r=20, t=20, b=10))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def city_weekly_fig() -> go.Figure:
+    data = get_data()
+    city_weekly = data.groupby(["date", "city"])[TARGET_COLUMN].sum().reset_index()
+    fig = px.line(city_weekly, x="date", y=TARGET_COLUMN, color="city",
+                  labels={TARGET_COLUMN: "Weekly cases", "date": "", "city": "City"})
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=10),
+                      title=dict(text="Weekly cases by city", font=dict(size=15)))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def seasonality_fig() -> go.Figure:
+    data = get_data()
+    tmp = data.copy()
+    tmp["iso_week"] = tmp["date"].dt.isocalendar().week.astype(int)
+    seasonal = tmp.groupby("iso_week")[TARGET_COLUMN].agg(["mean", "std"]).reset_index()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=seasonal["iso_week"], y=seasonal["mean"] + seasonal["std"],
+                             mode="lines", line=dict(width=0), showlegend=False))
+    fig.add_trace(go.Scatter(x=seasonal["iso_week"], y=seasonal["mean"] - seasonal["std"],
+                             mode="lines", fill="tonexty", fillcolor="rgba(36,113,163,0.15)",
+                             line=dict(width=0), showlegend=False))
+    fig.add_trace(go.Scatter(x=seasonal["iso_week"], y=seasonal["mean"], mode="lines+markers",
+                             name="Mean cases", line=dict(color="#2471a3")))
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=10),
+                      xaxis_title="ISO week of year", yaxis_title="Weekly cases",
+                      title=dict(text="Seasonality across the year (mean ± 1 SD)", font=dict(size=15)))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def corr_fig() -> go.Figure:
+    data = get_data()
+    corr_cols = WEATHER_COLS + [c for c in NUMERIC_FEATURES if "lag" in c] + [TARGET_COLUMN]
+    corr = data[corr_cols].corr(method="spearman").round(2)
+    corr.index = [FRIENDLY.get(c, c) for c in corr.index]
+    corr.columns = [FRIENDLY.get(c, c) for c in corr.columns]
+    fig = px.imshow(corr, text_auto=True, color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+                    aspect="auto")
+    fig.update_layout(height=560, margin=dict(l=10, r=10, t=30, b=10),
+                      title=dict(text="Spearman correlation (weather ↔ cases)", font=dict(size=15)))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def rain_scatter_fig() -> go.Figure:
+    data = get_data()
+    sample = data.sample(min(3000, len(data)), random_state=0)
+    fig = px.scatter(
+        sample, x="rainfall_mm", y=TARGET_COLUMN, color="city", opacity=0.4,
+        labels={"rainfall_mm": "Weekly rainfall (mm)", TARGET_COLUMN: "Weekly cases"},
+    )
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=10),
+                      title=dict(text="Rainfall vs dengue cases", font=dict(size=15)))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def dist_fig() -> go.Figure:
+    data = get_data()
+    sample = data.sample(min(3000, len(data)), random_state=0)
+    fig = px.histogram(
+        sample, x=TARGET_COLUMN, color="city", barmode="overlay", nbins=40, log_y=True,
+        labels={TARGET_COLUMN: "Weekly cases per ward", "count": "Ward-weeks (log)"},
+    )
+    fig.update_layout(height=230, margin=dict(l=10, r=10, t=20, b=10),
+                      title=dict(text="Case-count distribution by city", font=dict(size=15)))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def outlier_fig() -> go.Figure | None:
+    data = get_data()
+    flag_cols = [c for c in data.columns if c.endswith("_outlier")]
+    if not flag_cols:
+        return None
+    counts = data[flag_cols].sum().sort_values(ascending=True)
+    labels = [c.replace("_outlier", "").replace("_", " ") for c in counts.index]
+    fig = px.bar(
+        x=counts.to_numpy(), y=labels, orientation="h",
+        labels={"x": "Flagged records", "y": ""},
+    )
+    fig.update_layout(height=300, margin=dict(l=10, r=20, t=20, b=10),
+                      title=dict(text="Outlier flags (sanity + seasonal robust z-scores)",
+                                 font=dict(size=15)))
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Tabs
+# --------------------------------------------------------------------------- #
+def ward_selector(data: pd.DataFrame, key_prefix: str) -> tuple[str, pd.DataFrame]:
+    cities = sorted(data["city"].unique())
+    city = st.selectbox("City corporation", cities, key=f"{key_prefix}_city")
+    wards = sorted(data[data["city"] == city]["ward_id"].unique())
+    ward = st.selectbox("Ward", wards, key=f"{key_prefix}_ward")
+    return ward, data[data["ward_id"] == ward].sort_values("date").reset_index(drop=True)
+
+
+def predict_tab(data: pd.DataFrame) -> None:
+    st.subheader("Predict risk for one ward-week")
+    st.caption(
+        "Pick a ward and week — inputs refresh from that observation. Adjust weather to test "
+        "what-if scenarios; lag weather can be overridden under *Advanced*."
+    )
+    left, right = st.columns([1, 1.6], gap="large")
+    with left:
+        ward, ward_df = ward_selector(data, "pred")
+        labels = [
+            f"{d:%Y-%m-%d}  (week {int(pd.Timestamp(d).isocalendar().week):02d})"
+            for d in ward_df["date"]
+        ]
+        ix = st.selectbox("Target week", range(len(labels)), index=len(labels) - 1,
+                          format_func=lambda i: labels[i], key="pred_week")
+        row = ward_df.iloc[ix]
+
+        context = f"{ward}|{row['date']:%Y-%m-%d}"
+        if st.session_state.get("pred_context") != context:
+            input_values = {
+                "pred_t": row["avg_temp_c"],
+                "pred_r": row["rainfall_mm"],
+                "pred_h": row["relative_humidity_pct"],
+                "pred_maxt": row["max_temp_c"],
+                "pred_mint": row["min_temp_c"],
+            }
+            for col in NUMERIC_FEATURES:
+                if "lag" in col or col in STATIC_COLS:
+                    input_values[f"pred_{col}"] = row[col]
+            for key, value in input_values.items():
+                st.session_state[key] = float(value)
+            st.session_state["pred_context"] = context
+
+        st.markdown("**Current-week weather**")
+        c1, c2 = st.columns(2)
+        temp = c1.slider("Avg temp °C", 5.0, 45.0, float(row["avg_temp_c"]), 0.1, key="pred_t")
+        rain = c2.slider("Rainfall mm", 0.0, 400.0, float(row["rainfall_mm"]), 0.5, key="pred_r")
+        hum = c1.slider("Humidity %", 0.0, 100.0, float(row["relative_humidity_pct"]), 0.5, key="pred_h")
+        maxt = c2.slider("Max temp °C", 5.0, 50.0, float(row["max_temp_c"]), 0.1, key="pred_maxt")
+        mint = st.slider("Min temp °C", -5.0, 40.0, float(row["min_temp_c"]), 0.1, key="pred_mint")
+
+        overrides = {
+            "avg_temp_c": temp, "rainfall_mm": rain, "relative_humidity_pct": hum,
+            "max_temp_c": maxt, "min_temp_c": mint,
+        }
+        with st.expander("Advanced: lag weather & ward profile"):
+            for col in NUMERIC_FEATURES:
+                if "lag" not in col and col not in STATIC_COLS:
+                    continue
+                step = 0.01 if col in STATIC_COLS else 0.1
+                overrides[col] = st.number_input(
+                    FRIENDLY.get(col, col), value=float(row[col]), step=step, format="%.2f",
+                    key=f"pred_{col}",
+                )
+
+    feat = {c: float(row[c]) for c in NUMERIC_FEATURES}
+    feat.update({k: float(v) for k, v in overrides.items()})
+    values = tuple(feat[c] for c in NUMERIC_FEATURES)
+
+    drivers, pred, base_pred = compute_drivers(ward, row["city"], values)
+    tier = tier_for(ward, pred)
+    cut = ward_cutoffs(ward)
+    lo, hi = tier_interval(pred, tier, 80)
+
+    with right:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Predicted cases", f"{pred:.1f}", delta=f"{pred - base_pred:+.1f} vs ward normal")
+        m2.metric("Risk tier", tier.capitalize())
+        m3.metric("80% interval", f"{lo:.1f} – {hi:.1f}")
+        st.markdown(
+            f"Ward thresholds: medium ≥ **{cut['q75']:.0f}**, high ≥ **{cut['q90']:.0f}**, "
+            f"critical ≥ **{cut['q97']:.0f}** weekly cases",
+            help="Per-ward quantiles (q75/q90/q97) of observed cases; the same count can mean "
+                 "different risk in different wards.",
+        )
+        st.plotly_chart(
+            gauge_fig(pred / cut["q90"], tier, cut["q75"], cut["q90"], cut["q97"]),
+            use_container_width=True,
+        )
+
+        observed = float(row[TARGET_COLUMN])
+        obs_tier = tier_for(ward, observed)
+        st.info(
+            f"Observed in {row['date']:%Y-%m-%d}: **{observed:.0f} cases** "
+            f"({obs_tier}) — model {'over' if pred > observed else 'under'}-predicts by "
+            f"{abs(observed - pred):.1f}."
+        )
+
+        st.markdown("**What is driving this prediction?**")
+        if drivers.empty:
+            st.caption("All inputs sit at the ward's historical median — no strong driver this week.")
+        else:
+            st.plotly_chart(drivers_fig(drivers), use_container_width=True)
+            show = drivers.head(8)[["label", "actual", "normal", "delta"]].copy()
+            show.columns = ["Driver", "This input", "Ward normal", "Δ cases"]
+            show["This input"] = show["This input"].round(2)
+            show["Ward normal"] = show["Ward normal"].round(2)
+            show["Δ cases"] = show["Δ cases"].round(2)
+            st.dataframe(show, hide_index=True, use_container_width=True)
+            st.caption(
+                "Contribution = prediction with the real input minus prediction with that input "
+                "set to the ward's median. Approximate — features interact, so values won't sum "
+                "exactly to the total."
+            )
+
+
+def heatmap_tab() -> None:
+    st.subheader("Ward-level risk heatmap")
+    st.caption("Every ward-week at a glance — spot outbreaks spreading across wards and weeks.")
+    scores = score_history()
+    years = sorted(scores["date"].dt.year.unique())
+    cities = sorted(scores["city"].unique())
+    c1, c2, c3 = st.columns([1, 2, 2])
+    year = c1.selectbox("Year", years, index=len(years) - 1)
+    sel_cities = c2.multiselect("City corporations", cities, default=cities)
+    metric = c3.radio("Colour by", ["Predicted risk tier", "Predicted cases", "Observed cases"],
+                      horizontal=True)
+
+    fig = heatmap_fig(year, tuple(sel_cities), metric)
+    if fig is None:
+        st.warning("No data for this selection.")
+        return
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig2 = tier_mix_fig(year, tuple(sel_cities))
+    if fig2 is not None:
+        st.markdown("**Tier mix per city corporation** (share of ward-weeks)")
+        st.plotly_chart(fig2, use_container_width=True)
 
 
 def forecast_tab(data: pd.DataFrame) -> None:
     st.subheader("Multi-week forecast with confidence intervals")
     st.caption(
-        "Forecast ahead from an anchor week. Future weather is assumed from ward climatology "
-        "or the last observed week — the honest inputs available without a weather forecast. "
+        "Forecast ahead from an anchor week using only observations available at that time. "
+        "Future weather is assumed from ward climatology or the anchor week's weather. "
         "Bands are empirical intervals from 2024–25 holdout residuals."
     )
     left, right = st.columns([1, 1.9], gap="large")
@@ -585,7 +1017,7 @@ def forecast_tab(data: pd.DataFrame) -> None:
         labels = [f"{d:%Y-%m-%d}" for d in ward_df["date"]]
         anchor_ix = st.selectbox("Anchor week", range(len(labels)), index=len(labels) - 1,
                                  format_func=lambda i: labels[i], key="fc_anchor")
-        anchor = pd.Timestamp(ward_df.iloc[anchor_ix]["date"])
+        anchor = str(pd.Timestamp(ward_df.iloc[anchor_ix]["date"]).date())
         horizon = st.slider("Horizon (weeks)", 1, 12, 6)
         scenario = st.radio(
             "Future weather",
@@ -596,97 +1028,17 @@ def forecast_tab(data: pd.DataFrame) -> None:
         rain_mult = c2.selectbox("Rainfall multiplier", [0.5, 0.75, 1.0, 1.5, 2.0], index=2)
         level = st.selectbox("Interval level", [50, 80, 95], index=1)
 
-    feat = build_forecast(ward, anchor, horizon, scenario, temp_delta, rain_mult)
-    preds = predict_rows(feat)
-    tiers = [tier_for(ward, p) for p in preds]
-    cut = ward_cutoffs(ward)
-    intervals = [tier_interval(p, t, level) for p, t in zip(preds, tiers)]
-
-    table = pd.DataFrame(
-        {
-            "week": feat["date"],
-            "predicted_cases": np.round(preds, 1),
-            "tier": tiers,
-            "interval_low": [round(lo, 1) for lo, _ in intervals],
-            "interval_high": [round(hi, 1) for _, hi in intervals],
-        }
+    table, weather = compute_forecast(
+        ward, anchor, horizon, scenario, temp_delta, rain_mult, level
     )
-    top_drivers = []
-    for i in range(len(feat)):
-        d, _, _ = local_drivers(
-            {c: float(feat.iloc[i][c]) for c in NUMERIC_FEATURES}
-            | {"ward_id": ward, "city": feat.iloc[i]["city"]},
-            ward,
-        )
-        top_drivers.append("—" if d.empty else f"{d.iloc[0]['label']} ({d.iloc[0]['delta']:+.1f})")
-    table["top_driver"] = top_drivers
+    cut = ward_cutoffs(ward)
 
     with right:
-        hist = data[(data["ward_id"] == ward) & (data["date"] <= anchor)].tail(8)
-        fig = go.Figure()
-        low = [lo for lo, _ in intervals]
-        high = [hi for _, hi in intervals]
-        fig.add_trace(
-            go.Scatter(
-                x=list(feat["date"]) + list(feat["date"])[::-1],
-                y=high + low[::-1],
-                fill="toself",
-                fillcolor="rgba(31,119,180,0.18)",
-                line=dict(color="rgba(255,255,255,0)"),
-                name=f"{level}% interval",
-                hovertemplate="%{y:.1f} cases<extra></extra>",
-            )
+        st.plotly_chart(
+            forecast_fig(ward, anchor, level, cut["q90"], cut["q97"], table),
+            use_container_width=True,
         )
-        fig.add_trace(
-            go.Scatter(
-                x=feat["date"], y=np.round(preds, 1),
-                mode="lines+markers+text",
-                text=[f"{p:.1f}" for p in preds], textposition="top center",
-                marker=dict(size=11, color=[TIER_COLORS[t] for t in tiers]),
-                line=dict(color="#1f77b4", dash="dash"),
-                name="Forecast",
-            )
-        )
-        if not hist.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=hist["date"], y=hist[TARGET_COLUMN],
-                    mode="lines+markers", name="Observed (recent)",
-                    line=dict(color="#7f7f7f"),
-                )
-            )
-        for q, name, color in ((cut["q90"], "High-risk threshold", "#e67e22"),
-                               (cut["q97"], "Critical threshold", "#d62728")):
-            fig.add_hline(
-                y=q, line_dash="dot", line_color=color,
-                annotation_text=name, annotation_position="top left",
-            )
-        fig.update_layout(
-            height=420,
-            margin=dict(l=10, r=10, t=20, b=10),
-            yaxis_title="Weekly dengue cases",
-            xaxis_title="",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        wfig = go.Figure()
-        wfig.add_trace(
-            go.Bar(x=feat["date"], y=feat["rainfall_mm"], name="Rainfall (mm)",
-                   marker_color="#7fb3d5", yaxis="y")
-        )
-        wfig.add_trace(
-            go.Scatter(x=feat["date"], y=feat["avg_temp_c"], name="Avg temp °C",
-                       mode="lines+markers", line=dict(color="#c0392b"), yaxis="y2")
-        )
-        wfig.update_layout(
-            height=240, margin=dict(l=10, r=10, t=10, b=10),
-            yaxis=dict(title="Rainfall (mm)"),
-            yaxis2=dict(title="Avg temp °C", overlaying="y", side="right"),
-            legend=dict(orientation="h", y=1.15),
-            title=dict(text="Assumed weather inputs", font=dict(size=14)),
-        )
-        st.plotly_chart(wfig, use_container_width=True)
+        st.plotly_chart(weather_fig(weather), use_container_width=True)
 
     show = table.copy()
     show["week"] = show["week"].dt.strftime("%Y-%m-%d")
@@ -717,99 +1069,27 @@ def validation_tab() -> None:
     c6.metric("High-risk recall", f"{det['recall']:.1%}",
               help="Share of true high-risk ward-weeks (≥ ward q90) that the model flags")
 
-    hs = holdout_scores()
-
-    weekly = hs.groupby("date").agg(
-        mae=("abs_error", "mean"),
-        rmse=("residual", lambda s: float(np.sqrt((s**2).mean()))),
-    ).reset_index()
-    weekly["mae_4w"] = weekly["mae"].rolling(4, min_periods=1).mean()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=weekly["date"], y=weekly["rmse"], mode="lines",
-                             name="Weekly RMSE", line=dict(color="#c0392b", width=1)))
-    fig.add_trace(go.Scatter(x=weekly["date"], y=weekly["mae"], mode="lines",
-                             name="Weekly MAE", line=dict(color="#2471a3", width=1)))
-    fig.add_trace(go.Scatter(x=weekly["date"], y=weekly["mae_4w"], mode="lines",
-                             name="MAE (4-week avg)", line=dict(color="#2471a3", width=3)))
-    fig.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10),
-                      yaxis_title="Cases", title=dict(text="Error over time", font=dict(size=15)))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(error_over_time_fig(), use_container_width=True)
 
     left, right = st.columns(2)
     with left:
-        ward_mae = hs.groupby(["ward_id", "city"])["abs_error"].mean().reset_index()
-        ward_mae = ward_mae.sort_values("abs_error", ascending=False).head(15).iloc[::-1]
-        fig = px.bar(
-            ward_mae, x="abs_error", y="ward_id", color="city", orientation="h",
-            labels={"abs_error": "Mean absolute error (cases)", "ward_id": "", "city": "City"},
-        )
-        fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10),
-                          title=dict(text="Hardest wards (holdout MAE)", font=dict(size=15)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(hardest_wards_fig(), use_container_width=True)
     with right:
-        sample = hs.sample(min(2500, len(hs)), random_state=0)
-        fig = px.scatter(
-            sample, x="actual_cases", y="predicted_cases", color="actual_tier",
-            color_discrete_map=TIER_COLORS, category_orders={"actual_tier": TIER_ORDER},
-            opacity=0.55,
-            labels={"actual_cases": "Observed cases", "predicted_cases": "Predicted cases",
-                    "actual_tier": "Observed tier"},
-        )
-        lim = float(max(sample["actual_cases"].max(), sample["predicted_cases"].max())) * 1.05
-        fig.add_shape(type="line", x0=0, y0=0, x1=lim, y1=lim,
-                      line=dict(color="black", dash="dot"))
-        fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10),
-                          title=dict(text="Observed vs predicted (holdout sample)", font=dict(size=15)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(obs_vs_pred_fig(), use_container_width=True)
 
     left, right = st.columns(2)
     with left:
-        conf = pd.crosstab(hs["actual_tier"], hs["risk_tier"])
-        conf = conf.reindex(index=TIER_ORDER, columns=TIER_ORDER, fill_value=0)
-        fig = go.Figure(
-            go.Heatmap(
-                z=conf.to_numpy(), x=[t.capitalize() for t in TIER_ORDER],
-                y=[t.capitalize() for t in TIER_ORDER], text=conf.to_numpy(),
-                texttemplate="%{text}", colorscale="Blues", showscale=False,
-                hovertemplate="Observed %{y} → predicted %{x}: %{z} ward-weeks<extra></extra>",
-            )
-        )
-        fig.update_layout(height=330, margin=dict(l=10, r=10, t=10, b=10),
-                          xaxis_title="Predicted tier", yaxis_title="Observed tier",
-                          title=dict(text="Tier confusion matrix", font=dict(size=15)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(confusion_fig(), use_container_width=True)
     with right:
+        hs = holdout_scores()
         ward_mae_all = hs.groupby("ward_id")["abs_error"].mean()
         wards_sorted = sorted(hs["ward_id"].unique())
         ward = st.selectbox("Drill into ward", wards_sorted,
                             index=wards_sorted.index(ward_mae_all.idxmax()), key="val_ward")
-        sub = hs[hs["ward_id"] == ward].sort_values("date")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=sub["date"], y=sub["actual_cases"], name="Observed",
-                                 mode="lines+markers", line=dict(color="#7f7f7f")))
-        fig.add_trace(go.Scatter(x=sub["date"], y=sub["predicted_cases"], name="Predicted",
-                                 mode="lines+markers", line=dict(color="#2471a3", dash="dash")))
-        fig.add_trace(go.Bar(x=sub["date"], y=sub["abs_error"], name="Absolute error",
-                             marker_color="#e6b0aa", yaxis="y2"))
-        fig.update_layout(
-            height=330, margin=dict(l=10, r=10, t=10, b=10),
-            yaxis=dict(title="Cases"),
-            yaxis2=dict(title="Abs error", overlaying="y", side="right", showgrid=False),
-            legend=dict(orientation="h", y=1.12),
-            title=dict(text=f"{ward} — observed vs predicted over holdout", font=dict(size=15)),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(ward_drill_fig(ward), use_container_width=True)
 
     st.markdown("**What drives the model overall?** (permutation importance on holdout MAE)")
-    imp = global_importance()
-    show = imp.sort_values("importance").tail(14)
-    fig = px.bar(
-        show, x="importance", y="label", orientation="h",
-        error_x=show["std"],
-        labels={"importance": "MAE increase when shuffled (cases)", "label": ""},
-    )
-    fig.update_layout(height=480, margin=dict(l=10, r=20, t=20, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(importance_fig(), use_container_width=True)
     st.caption(
         f"Holdout: {m['rows']:,} ward-weeks · {metadata['holdout_window'][0]} to "
         f"{metadata['holdout_window'][1]} · high-risk detection ROC-AUC {det['roc_auc']:.3f}, "
@@ -817,7 +1097,8 @@ def validation_tab() -> None:
     )
 
 
-def explorer_tab(data: pd.DataFrame) -> None:
+def explorer_tab() -> None:
+    data = get_data()
     st.subheader("Statistical data explorer")
     st.caption(f"Weekly ward-level observations, {data['date'].min():%Y-%m-%d} to "
                f"{data['date'].max():%Y-%m-%d} · {data['ward_id'].nunique()} wards · "
@@ -825,69 +1106,19 @@ def explorer_tab(data: pd.DataFrame) -> None:
 
     left, right = st.columns(2)
     with left:
-        city_weekly = data.groupby(["date", "city"])[TARGET_COLUMN].sum().reset_index()
-        fig = px.line(city_weekly, x="date", y=TARGET_COLUMN, color="city",
-                      labels={TARGET_COLUMN: "Weekly cases", "date": "", "city": "City"})
-        fig.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=10),
-                          title=dict(text="Weekly cases by city", font=dict(size=15)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(city_weekly_fig(), use_container_width=True)
     with right:
-        tmp = data.copy()
-        tmp["iso_week"] = tmp["date"].dt.isocalendar().week.astype(int)
-        seasonal = tmp.groupby("iso_week")[TARGET_COLUMN].agg(["mean", "std"]).reset_index()
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=seasonal["iso_week"], y=seasonal["mean"] + seasonal["std"],
-                                 mode="lines", line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=seasonal["iso_week"], y=seasonal["mean"] - seasonal["std"],
-                                 mode="lines", fill="tonexty", fillcolor="rgba(36,113,163,0.15)",
-                                 line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=seasonal["iso_week"], y=seasonal["mean"], mode="lines+markers",
-                                 name="Mean cases", line=dict(color="#2471a3")))
-        fig.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=10),
-                          xaxis_title="ISO week of year", yaxis_title="Weekly cases",
-                          title=dict(text="Seasonality across the year (mean ± 1 SD)", font=dict(size=15)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(seasonality_fig(), use_container_width=True)
 
     left, right = st.columns(2)
     with left:
-        corr_cols = WEATHER_COLS + [c for c in NUMERIC_FEATURES if "lag" in c] + [TARGET_COLUMN]
-        corr = data[corr_cols].corr(method="spearman").round(2)
-        corr.index = [FRIENDLY.get(c, c) for c in corr.index]
-        corr.columns = [FRIENDLY.get(c, c) for c in corr.columns]
-        fig = px.imshow(corr, text_auto=True, color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
-                        aspect="auto")
-        fig.update_layout(height=560, margin=dict(l=10, r=10, t=30, b=10),
-                          title=dict(text="Spearman correlation (weather ↔ cases)", font=dict(size=15)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(corr_fig(), use_container_width=True)
     with right:
-        sample = data.sample(min(3000, len(data)), random_state=0)
-        fig = px.scatter(
-            sample, x="rainfall_mm", y=TARGET_COLUMN, color="city", opacity=0.4,
-            labels={"rainfall_mm": "Weekly rainfall (mm)", TARGET_COLUMN: "Weekly cases"},
-        )
-        fig.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=10),
-                          title=dict(text="Rainfall vs dengue cases", font=dict(size=15)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(rain_scatter_fig(), use_container_width=True)
+        st.plotly_chart(dist_fig(), use_container_width=True)
 
-        fig = px.histogram(
-            sample, x=TARGET_COLUMN, color="city", barmode="overlay", nbins=40, log_y=True,
-            labels={TARGET_COLUMN: "Weekly cases per ward", "count": "Ward-weeks (log)"},
-        )
-        fig.update_layout(height=230, margin=dict(l=10, r=10, t=20, b=10),
-                          title=dict(text="Case-count distribution by city", font=dict(size=15)))
-        st.plotly_chart(fig, use_container_width=True)
-
-    flag_cols = [c for c in data.columns if c.endswith("_outlier")]
-    if flag_cols:
-        counts = data[flag_cols].sum().sort_values(ascending=True)
-        labels = [c.replace("_outlier", "").replace("_", " ") for c in counts.index]
-        fig = px.bar(
-            x=counts.to_numpy(), y=labels, orientation="h",
-            labels={"x": "Flagged records", "y": ""},
-        )
-        fig.update_layout(height=300, margin=dict(l=10, r=20, t=20, b=10),
-                          title=dict(text="Outlier flags (sanity + seasonal robust z-scores)",
-                                     font=dict(size=15)))
+    fig = outlier_fig()
+    if fig is not None:
         st.plotly_chart(fig, use_container_width=True)
 
 
@@ -942,13 +1173,13 @@ def main() -> None:
     with tab_predict:
         predict_tab(data)
     with tab_heat:
-        heatmap_tab(score_history())
+        heatmap_tab()
     with tab_forecast:
         forecast_tab(data)
     with tab_valid:
         validation_tab()
     with tab_explore:
-        explorer_tab(data)
+        explorer_tab()
 
 
 if __name__ == "__main__":

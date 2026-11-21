@@ -103,8 +103,14 @@ and risk-tier helpers.
 
 The Streamlit dashboard provides single-week prediction and weather-driver
 analysis, a ward/week heatmap, 1–12 week forecasts, chronological validation,
-and a data explorer. Forecast weather is explicitly assumed from ward
-climatology or the latest observed week; it is not a live weather forecast.
+and a data explorer. Interactive speed comes from two rules: model predictions
+are always issued as one batched `predict` call per operation (a single
+pipeline pass costs ~7 ms regardless of row count, so per-feature and
+per-week loops would dominate response time), and per-tab figures/derived
+tables are cached with `st.cache_data` on hashable inputs, so a widget change
+only recomputes the outputs that depend on it. Forecast weather is explicitly
+assumed from ward climatology or the latest observed week; it is not a live
+weather forecast.
 Forecast intervals use empirical 2024–2025 holdout residuals. Because the
 deployed model was refit on all data, the dashboard separately trains and caches
 a pre-2024 evaluation model for genuinely out-of-sample validation charts.
